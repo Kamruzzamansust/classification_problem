@@ -30,12 +30,14 @@ def build_df():
 
 calls = []
 env_seen = []
+budgets = []
 
 
 def fake_run_templates(ws, ids, model, **kw):
     """What the agent would do: write FAM_RX for the Popular family, fail for anything else (respecting skip_done like the real one)."""
     calls.append({"ids": list(ids), "model": model, **kw})
     env_seen.append(os.environ.get("LLM_REASONING_EFFORT"))
+    budgets.append(ws.budget_s)
     reg, res = RW.load_registry(), {}
     for i in ids:
         if kw["skip_done"] and i in reg:
@@ -316,6 +318,16 @@ def test_field_summary():
     assert {"branch", "due_date"} <= set(EC.field_summary(out).field), "without a category: every row"
     assert EC.field_summary(out, LOAN).empty
     print("OK  field_summary: which fields were extracted, how often, from the regex or from the generic fallback")
+
+
+def test_time_budget_and_retry_failed_reach_the_writer():
+    df = build_df()
+    with_stubs(lambda: EC.extract_categories(df, MED, work_dir=tempfile.mkdtemp(), model="m", verbose=False))
+    assert budgets[-1] == RW.FAMILY_BUDGET_S and calls[-1]["retry_failed"] is False, "defaults: 20 minutes per family, failed families are left alone"
+    out = with_stubs(lambda: EC.extract_categories(df, MED, work_dir=tempfile.mkdtemp(), model="m", verbose=False, family_seconds=77, retry_failed=True))
+    assert budgets[-1] == 77 and calls[-1]["retry_failed"] is True
+    assert {"partial", "waived"} <= set(out.attrs["regex_summary"].columns)
+    print("OK  family_seconds and retry_failed reach the regex writer; the summary counts the regexes accepted under the relaxed limit (waived)")
 
 
 if __name__ == "__main__":

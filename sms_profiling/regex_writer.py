@@ -41,15 +41,17 @@ from .templates import CAT_COL, ID_COL, TEXT_COL, family_keys, family_registry
 
 from . import OUTPUT_DIR
 REGISTRY_PATH = OUTPUT_DIR / "regex_registry.json"
+FAILED_PATH = OUTPUT_DIR / "failed_families.json"   # families that did not get a regex, so that the next run does not spend its time on them again
 LOG_DIR = OUTPUT_DIR / "logs"    # one transcript per template: what the agent tried and why a check failed
 DEFAULT_SAMPLES = 5              # sample messages the agent gets to read per template
 
 
 def set_output_dir(path):
     """Where templates_registry.csv / message_templates.csv are read from and regex_registry.json + logs written."""
-    global OUTPUT_DIR, REGISTRY_PATH, LOG_DIR
+    global OUTPUT_DIR, REGISTRY_PATH, LOG_DIR, FAILED_PATH
     OUTPUT_DIR = Path(path)
     REGISTRY_PATH = OUTPUT_DIR / "regex_registry.json"
+    FAILED_PATH = OUTPUT_DIR / "failed_families.json"
     LOG_DIR = OUTPUT_DIR / "logs"
 DEFAULT_BACKEND = "vllm"
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000/v1")
@@ -69,10 +71,20 @@ DEFAULT_RETRIES = 2       # extra agent runs when a family is not solved: 1 = de
 SOFT_MATCH_RATE = 0.85    # the last rung accepts a regex that reads at least this share of the family; the rest gets a second regex
 LEFTOVER_MIN_TEXTS = 3    # distinct messages a regex missed before it is worth a second regex for them
 MAX_LEFTOVER_DEPTH = 2    # a family may have a main regex plus two more for what the earlier ones missed
-SIMILAR_TEMPLATE_RATIO = 0.9   # templates of one category that are at least this similar are the same kind of message (see Workspace.related_units)
+OK_RESULTS = ("SAVED", "already saved", "constant notice")   # results that are not failures
+MIN_OTHER_TEMPLATE_MESSAGES = 5   # a unit with fewer messages never gets a regex of its own (min_messages): it is not an 'other template' for the too-generic check
+SIMILAR_TEMPLATE_RATIO = 0.8   # templates of one category that are at least this similar are the same kind of message (see Workspace._similar_units;
+                               # measured on card-purchase messages: the same message in a close shape is 0.84, different messages of one bank are <= 0.5)
 # What happens, on its own, when a family does not pass the checks: (name, sample messages, step limit, reasoning effort for Qwen3.8).
 # More, MORE DIFFERENT samples and more steps for a messy family; a lower match floor on the last rung.
 LADDER = [("normal", None, 60, None), ("deeper", 10, 100, "xhigh"), ("soft landing", 10, 100, "xhigh")]
+SOFT_FP_CEILING = 0.5     # from the second rung on, a regex that passes every other check may match up to this share of other templates' messages
+                          # (it cannot make the family's own extraction wrong: a message is read by the regex of its own template / family); recorded as "waived"
+STALL_ATTEMPTS = 4        # this many tests in a row that hit the same wall without progress end the run: the next rung tries another way
+STALL_PROGRESS = 0.02     # progress = the score (match rate - false positives - 2% per item left out) rose by at least this much
+FAMILY_BUDGET_S = 1200    # wall-clock seconds one family may use over all its rungs (no new rung starts after it; a running one stops at its next step)
+# CHECKS_VERSION (end of this file) fingerprints the checks' code and limits: families that failed under other checks are tried again by themselves
+RETRY_FAILED_DAYS = 7     # a family that failed is left alone for this long (retry_failed=True ignores it)
 MAX_OUTPUT_TOKENS = None  # no cap on a reply: vLLM rejects a request when conversation + cap exceed its 16K window (a cap of 8192 left only 8K for the
                           # conversation and the run died with ContextOverflowError). A run that never tests anything is retried without reasoning instead.
 MAX_TEST_TEXTS = 2000
@@ -81,6 +93,11 @@ HEARTBEAT_S = 60          # with several workers a line is printed only when a f
 # extracting it is the point of the OTP category.
 SENSITIVE_FIELD_WORDS = ("password", "passwd", "passcode", "pin", "cvv", "cvc", "secret")
 _SENSITIVE = re.compile(r"(^|_)(" + "|".join(SENSITIVE_FIELD_WORDS) + r")($|_)")
+
+
+def _kind(problem):
+    """What kind of wall a problem is (its text without numbers, names and values): lets the ladder see that the agent keeps hitting the same one."""
+    return re.sub(r"\[[^\]]*\]|'[^']*'|\{[^}]*\}|[0-9][0-9.,%]*", "#", str(problem))[:45]
 
 
 def is_sensitive_name(name):
@@ -336,6 +353,10 @@ class Workspace:
         self.samples_for = {}                             # unit id -> number of sample messages to show (default n_samples)
         self.parent_of = {}                               # leftover unit id -> the unit whose regex missed these messages
         self.notes = defaultdict(list)                    # unit id -> what the ladder did (for the report)
+        self.fp_ceiling = {}                              # unit id -> share of other templates' messages a regex may match (default MAX_FALSE_POSITIVE; raised from rung 2)
+        self.history = defaultdict(list)                  # unit id -> (kind of the first problem, score) of every test of the current run
+        self.deadline = {}                                # unit id -> time.time() after which no new rung starts
+        self.budget_s = FAMILY_BUDGET_S                   # seconds a family may use in all (extract_categories(family_seconds=...))
         self._lock = threading.Lock()
 
     @classmethod
@@ -414,6 +435,22 @@ class Workspace:
             self._similar[tid] = close
         return self._similar[tid]
 
+    def record_attempt(self, tid, problems, score):
+        self.history[tid].append((_kind(problems[0]) if problems else "", score))
+
+    def stalled(self, tid, n=STALL_ATTEMPTS):
+        """The last n tests all failed on the same kind of problem and the score did not improve: the agent is going round in circles."""
+        h = self.history[tid][-n:]
+        if len(h) < n or not h[0][0] or len({k for k, _ in h}) != 1:
+            return False
+        return max(s for _, s in h[1:]) < h[0][1] + STALL_PROGRESS
+
+    def is_constant_notice(self, tid):
+        """Every message of the unit is the very same text and the template has no variable part (a fixed notice such as 'your cheque book is ready').
+        There is nothing to extract from it: a regex would have to capture fixed text, which the checks rightly refuse, so the agent is not asked."""
+        texts = {re.sub(r"\s+", " ", t).strip() for t in self.texts.get(tid, []) if isinstance(t, str) and t.strip()}
+        return len(texts) == 1 and all(not re.search(r"\[[A-Z_*]+\]", str(t)) for t in self._templates_of(tid))
+
     def phrases_of(self, tid):
         """The fixed text of a unit's messages as numbered pieces {L1}, {L2}... (computed once)."""
         if tid not in self._phrases:
@@ -460,12 +497,45 @@ class Workspace:
         related = self.related_units(tid)
         others = self.registry[(self.registry["category"] == cat) & (self.registry.index != tid) & ~self.registry.index.isin(related)]
         others = others[pd.Series([self._skeleton(t) != skel for t in others["template"]], index=others.index, dtype=bool)]
+        if "message_count" in others.columns:                # 3 messages of a sibling shape would weigh 3 / 28 = 11% in a small category's pool
+            others = others[others["message_count"].astype(float) >= MIN_OTHER_TEMPLATE_MESSAGES]
         pool = [t for o in others.index[:60] for t in self.texts.get(o, [])[:20]]  # biggest other templates
         return pool if len(pool) <= n else pd.Series(pool).sample(n, random_state=0).tolist()
 
 
 def load_registry():
     return json.loads(REGISTRY_PATH.read_text(encoding="utf-8")) if REGISTRY_PATH.exists() else {}
+
+
+def load_failed():
+    try:
+        return json.loads(FAILED_PATH.read_text(encoding="utf-8")) if FAILED_PATH.exists() else {}
+    except ValueError:
+        return {}
+
+
+def known_failure(tid):
+    """The stored record of a family that failed recently under the CURRENT checks (None: it is worth a try: never failed, failed under older
+    rules, or failed more than RETRY_FAILED_DAYS ago). Without this every daily run would spend its time on the same hopeless families."""
+    e = load_failed().get(tid)
+    if not e or e.get("checks_version") != CHECKS_VERSION:
+        return None
+    try:
+        age_days = (time.time() - time.mktime(time.strptime(e["failed_at"], "%Y-%m-%d %H:%M:%S"))) / 86400
+    except (KeyError, ValueError):
+        return None
+    return e if age_days < RETRY_FAILED_DAYS else None
+
+
+def _store_failures(failed_now, solved):
+    with _REGISTRY_LOCK:
+        failed = load_failed()
+        before = dict(failed)
+        failed.update(failed_now)
+        for tid in solved:
+            failed.pop(tid, None)
+        if failed != before:
+            FAILED_PATH.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def explain_mismatch(pattern, text, phrases=None):
@@ -509,9 +579,11 @@ def evaluate(ws, tid, pattern, facts=None):
         expanded = expand_macros(pattern, phrases)
         rx = regex.compile(normalize(expanded))
     except Exception as e:  # bad macro, bad syntax...
+        ws.record_attempt(tid, ["error"], -1.0)
         return {"error": f"{type(e).__name__}: {e}"}
     names = list(rx.groupindex)
     if not names:
+        ws.record_attempt(tid, ["error"], -1.0)
         return {"error": "pattern has no named groups; use (?P<field_name>...) for every value to extract"}
 
     anchors = anchor_words(pattern, phrases)
@@ -557,8 +629,9 @@ def evaluate(ws, tid, pattern, facts=None):
                         "placeholders; use {MACRO}s for [AMOUNT]/[DATE]/... so raw values match too")
     if timeouts:
         problems.append(f"{timeouts} match(es) timed out: remove nested/ambiguous quantifiers")
-    if fp_rate > MAX_FALSE_POSITIVE:
-        problems.append(f"too generic: matches {fp_rate:.0%} of other templates' messages (max {MAX_FALSE_POSITIVE:.0%}); "
+    ceiling = ws.fp_ceiling.get(tid, MAX_FALSE_POSITIVE)
+    if fp_rate > ceiling:
+        problems.append(f"too generic: matches {fp_rate:.0%} of other templates' messages (max {ceiling:.0%}); "
                         "add fixed anchor words from this template's own wording")
     if len(anchors) < MIN_ANCHOR_WORDS:
         problems.append(f"too generic: only {len(anchors)} fixed word(s) in the pattern (need >= {MIN_ANCHOR_WORDS}); "
@@ -608,6 +681,7 @@ def evaluate(ws, tid, pattern, facts=None):
         if blocking:
             problems.append(comp.describe_gaps(meas, lambda x: _mask(x, 40)))
     ws.last_problems[tid] = list(problems)                  # what blocked this unit last: shown in the report of the families that stay without a regex
+    ws.record_attempt(tid, problems, match_rate - fp_rate - 0.02 * sum(len(v) for v in left_out.values() if isinstance(v, (list, tuple, set))))
     return {
         "passed": not problems,
         "problems": problems,
@@ -616,6 +690,7 @@ def evaluate(ws, tid, pattern, facts=None):
         "match_rate": round(match_rate, 3),
         "hydrated_rate": round(hyd_rate, 3),
         "other_templates_match_rate": round(fp_rate, 3),
+        "other_templates_ceiling": ceiling,
         "timeouts": timeouts,
         "anchor_words": anchors,
         "fields": fields,
@@ -705,6 +780,7 @@ def make_tools(ws, model_name):
             "text_normalization": "NFC",  # normalize incoming messages the same way before matching
             "metrics": {k: res[k] for k in ("tested_on", "match_rate", "hydrated_rate", "other_templates_match_rate")},
             **({"partial": True} if res["match_rate"] < MIN_MATCH_RATE else {}),          # accepted on the last rung: it reads most of the family, not 95%
+            **({"waived": {"other_templates_match_rate": res["other_templates_match_rate"]}} if res["other_templates_match_rate"] > MAX_FALSE_POSITIVE else {}),   # accepted under the relaxed limit of rung 2+
             **({"parent": ws.parent_of[template_id]} if template_id in ws.parent_of else {}),   # a second regex for what the parent's regex misses
             "model": model_name,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -903,7 +979,7 @@ class Progress:
         for label, val, ok in [
             ("matches its own template", f"{r['match_rate']:.0%}  of {r['tested_on']} messages", r["match_rate"] >= MIN_MATCH_RATE),
             ("works on raw-style values", f"{r['hydrated_rate']:.0%}", r["hydrated_rate"] >= MIN_HYDRATED_RATE),
-            ("matches OTHER templates", f"{r['other_templates_match_rate']:.0%}  (lower is better)", r["other_templates_match_rate"] <= MAX_FALSE_POSITIVE),
+            ("matches OTHER templates", f"{r['other_templates_match_rate']:.0%}  (lower is better)", r["other_templates_match_rate"] <= r.get("other_templates_ceiling", MAX_FALSE_POSITIVE)),
             ("fixed anchor words", f"{len(r['anchor_words'])}  ({', '.join(r['anchor_words'][:4])[:50]})",
              len(r["anchor_words"]) >= MIN_ANCHOR_WORDS),
             ("timeouts", str(r["timeouts"]), r["timeouts"] == 0),
@@ -931,7 +1007,7 @@ class Progress:
         for col in ("template", "messages", "result", "attempts", "time"):
             t.add_column(col)
         for tid, msgs, result, attempts, secs in rows:
-            style = "green" if result in ("SAVED", "already saved") else "red"
+            style = "green" if result in OK_RESULTS else "red"
             t.add_row(tid, f"{msgs:,}", Text(result, style=style), str(attempts), f"{secs:.0f}s")
         self.say(t)
 
@@ -955,6 +1031,12 @@ def _agent_run(ws, tid, prompt, model_name, think, backend, ui, effort, recursio
             for update in chunk.values():
                 for msg in _update_messages(update):
                     ui.on_message(msg)
+            if ws.stalled(tid):                                # same wall STALL_ATTEMPTS times without progress: stop this run, the next rung goes another way
+                ui.log_only(Text(f"--- stopped: the last {STALL_ATTEMPTS} tests failed the same way ({ws.history[tid][-1][0]!r}) without progress"))
+                return f"no regex saved (stalled on: {ws.last_problems.get(tid, ['?'])[0][:90]})"
+            if ws.deadline.get(tid) and time.time() > ws.deadline[tid]:
+                ui.log_only(Text(f"--- stopped: the time budget of {ws.budget_s:.0f}s for this family is used"))
+                return "no regex saved (time budget used)"
         after = load_registry().get(tid)
         return "SAVED" if after is not None and after != before else "no regex saved (checks not passed)"
     except Exception as e:
@@ -975,8 +1057,15 @@ def _run_one(ws, tid, model_name, think, backend, ui, retries=DEFAULT_RETRIES, d
     result = "not run"
     ws.match_floor.pop(tid, None)                         # a ladder always starts at the normal rung, also on a second call
     ws.samples_for.pop(tid, None)
+    ws.fp_ceiling.pop(tid, None)
+    ws.deadline[tid] = t0 + ws.budget_s
     rungs = LADDER[:1 + max(0, retries)]
     for run, (rung, n_samples, recursion, effort) in enumerate(rungs, 1):
+        if run > 1 and time.time() > ws.deadline[tid]:
+            result = f"no regex saved (time budget of {ws.budget_s:.0f}s used)"
+            ui.log_only(Text(f"--- no rung {run}: {result}"))
+            break
+        ws.history[tid].clear()                           # every rung gets its own window for the stall check
         prompt = f"Write, verify and save the extraction regex for template_id={tid}"
         if run > 1:
             problems = "; ".join(p[:140] for p in ws.last_problems.get(tid, [])[:3])
@@ -988,6 +1077,9 @@ def _run_one(ws, tid, model_name, think, backend, ui, retries=DEFAULT_RETRIES, d
                            "call test_regex, then save_regex. Do not reply with text only.")
             ws.samples_for[tid] = n_samples
             ws.notes[tid].append(f"rung {run}: {rung}")
+            ws.fp_ceiling[tid] = SOFT_FP_CEILING
+            prompt += (f" The limit for matching OTHER templates' messages is now {SOFT_FP_CEILING:.0%} (test_regex reports it): close variants of this "
+                       "message type exist, so a regex that also reads them is fine; keep it specific to this template's own fixed wording otherwise.")
         if rung == "soft landing":
             ws.match_floor[tid] = SOFT_MATCH_RATE
             prompt += (f" This template has several different layouts, which is why the normal checks keep failing. Write the regex for the MAIN "
@@ -1016,7 +1108,7 @@ def _run_one(ws, tid, model_name, think, backend, ui, retries=DEFAULT_RETRIES, d
 
 
 def run_templates(ws, template_ids, model_name=None, skip_done=True, verbose=True, think=False,
-                  backend=DEFAULT_BACKEND, workers=1, retries=DEFAULT_RETRIES):
+                  backend=DEFAULT_BACKEND, workers=1, retries=DEFAULT_RETRIES, retry_failed=False):
     model_name = model_name or default_model(backend)
     ui = Progress(verbose)
     ui.say(Rule(f"{model_name}  ·  {backend}  ·  {len(template_ids)} template(s)  ·  {workers} worker(s)"))
@@ -1024,7 +1116,18 @@ def run_templates(ws, template_ids, model_name=None, skip_done=True, verbose=Tru
     todo = []
     for i, tid in enumerate(template_ids, 1):
         msgs = int(ws.registry.at[tid, "message_count"])
-        if skip_done and tid in load_registry():
+        if ws.is_constant_notice(tid) and not (skip_done and tid in load_registry()):
+            results[tid] = "constant notice"
+            ui.say(Text(f"Template {i}/{len(template_ids)} {tid}: constant notice (all {msgs} messages are the same text, nothing to extract), no regex needed", style="dim"))
+            rows[tid] = (tid, msgs, results[tid], 0, 0.0)
+        elif skip_done and not retry_failed and (known := known_failure(tid)):
+            results[tid] = "failed before (skipped)"
+            ws.last_problems[tid] = [known["blocked_by"]] if known.get("blocked_by") else []
+            ui.say(Text(f"Template {i}/{len(template_ids)} {tid}: failed on {known['failed_at'][:10]} ({str(known.get('result', ''))[:60]}), skipping "
+                        "(retry_failed=True tries it again; it is tried again by itself after the checks change or after "
+                        f"{RETRY_FAILED_DAYS} days)", style="dim"))
+            rows[tid] = (tid, msgs, results[tid], 0, 0.0)
+        elif skip_done and tid in load_registry():
             results[tid] = "already saved"
             ui.say(Text(f"Template {i}/{len(template_ids)} {tid}: already saved, skipping", style="dim"))
             rows[tid] = (tid, msgs, results[tid], 0, 0.0)
@@ -1056,8 +1159,31 @@ def run_templates(ws, template_ids, model_name=None, skip_done=True, verbose=Tru
                                 f"{len(rows) + 1}/{len(template_ids)} done", style="bold"))
                     rows[tid] = (tid, msgs, results[tid], attempts, secs)
     ui.say(Text(f"wall time: {time.time() - wall0:.0f}s", style="dim"))
+    failed_now = {tid: {"category": ws.category_of(tid), "messages": msgs, "result": str(results[tid])[:120],
+                        "blocked_by": ((ws.last_problems.get(tid) or [""])[0])[:200], "checks_version": CHECKS_VERSION,
+                        "failed_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                  for _, tid, msgs in todo if results[tid] not in OK_RESULTS and not is_connection_error(results[tid])}
+    _store_failures(failed_now, [tid for _, tid, _ in todo if results[tid] in OK_RESULTS])      # a family that now has a regex is no longer "failed"
     ui.summary([rows[t] for t in template_ids])
-    failed = [t for t in template_ids if results[t] not in ("SAVED", "already saved")]
+    failed = [t for t in template_ids if results[t] not in OK_RESULTS]
     for t in failed:
         ui.say(Text(f"  ✗ {t}: see {LOG_DIR.name}/{t}.log", style="red"))
     return results
+
+
+def _checks_fingerprint():
+    """A short hash of everything that decides whether a regex passes: the code of the checks and their limits. A family that failed under other
+    checks is worth another try, so this changes by itself whenever a check or a limit is changed (nobody has to remember to bump a number)."""
+    try:
+        import hashlib
+        import inspect
+        parts = [inspect.getsource(evaluate), inspect.getsource(Workspace.other_template_texts), inspect.getsource(Workspace._similar_units),
+                 inspect.getsource(Workspace.related_units), inspect.getsource(comp),
+                 repr((MIN_MATCH_RATE, MIN_HYDRATED_RATE, MAX_FALSE_POSITIVE, MIN_ANCHOR_WORDS, SOFT_MATCH_RATE, SOFT_FP_CEILING, SIMILAR_TEMPLATE_RATIO,
+                       MIN_OTHER_TEMPLATE_MESSAGES, STALL_ATTEMPTS, STALL_PROGRESS, LADDER))]
+        return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:10]
+    except (OSError, TypeError):                       # no source available (a compiled-only install): fall back to a fixed label
+        return "unknown"
+
+
+CHECKS_VERSION = _checks_fingerprint()

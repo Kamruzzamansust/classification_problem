@@ -239,6 +239,7 @@ def stage_regex(a):
     model = a.model or rw.default_model(a.backend)
     rw.check_backend(a.backend, model)
     ws = rw.Workspace.from_output(out_dir, n_samples=a.samples, families=not a.no_families)
+    ws.budget_s = a.family_seconds
 
     tally = []
     for cat in cats:
@@ -248,8 +249,8 @@ def stage_regex(a):
             continue
         print(f"\n=== {cat}: {len(sel)} {units}, {got:.0%} of its messages ===")
         res = rw.run_templates(ws, sel["template_id"].tolist(), model, verbose=not a.quiet, skip_done=not a.redo,
-                               think=a.think, backend=a.backend, workers=a.workers, retries=a.retries)
-        saved = sum(v in ("SAVED", "already saved") for v in res.values())
+                               think=a.think, backend=a.backend, workers=a.workers, retries=a.retries, retry_failed=a.retry_failed)
+        saved = sum(v in rw.OK_RESULTS for v in res.values())
         tally.append({"category": cat, "templates": len(res), "saved": saved,
                       "failed": len(res) - saved, "coverage_pct": round(100 * got, 1)})
     if tally:
@@ -318,6 +319,8 @@ def stage_run(a):
         reg_args += ["--max-templates", a.max_templates]
     reg_args += ["--all"] if a.all else sum((["--category", c] for c in a.category), [])
     reg_args += ["--no-families"] if a.no_families else []
+    reg_args += ["--retry-failed"] if a.retry_failed else []
+    reg_args += ["--family-seconds", a.family_seconds]
     reg_args += ["--think"] if a.think else []
     reg_args += ["--quiet"] if a.quiet else []
 
@@ -355,6 +358,8 @@ def _add_common(p, with_regex=True, with_classify=False):
                             "cannot be checked for generalization (default %(default)s; use 1 for small test samples)")
         p.add_argument("--max-templates", type=int, help="cap on templates (families) per category (coverage may then stay below target)")
         p.add_argument("--redo", action="store_true", help="write the regexes again even for templates / families that already have one (the old one is replaced when the new one passes)")
+        p.add_argument("--retry-failed", action="store_true", help="try the families again that failed recently (otherwise they are left alone for 7 days and until the checks change)")
+        p.add_argument("--family-seconds", type=int, default=1200, help="the most time one family may use over all its attempts (default 1200)")
         p.add_argument("--no-families", action="store_true",
                        help="one regex per template instead of one per family (templates that differ only in one varying part, e.g. the branch)")
         p.add_argument("--workers", type=int, default=5, help="templates written in parallel (default 5)")

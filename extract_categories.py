@@ -54,6 +54,7 @@ def extract_categories(df: Union[pd.DataFrame, str, Path], categories: Union[str
                        reasoning_effort: Optional[str] = None, samples: int = 5, coverage: float = 0.8, min_messages: int = 5, retries: int = 2,
                        redo: bool = False, families: bool = True, fallback: bool = True, keep_identifiers: bool = False,
                        only_selected: bool = False, auto_restart: bool = True, max_restarts: int = 3, max_new: Optional[int] = None,
+                       family_seconds: Optional[int] = None, retry_failed: bool = False,
                        start_recipe: Optional[dict] = None, verbose: bool = True,
                        text_col: str = "message_decoded", category_col: str = "Predicted_Category") -> pd.DataFrame:
     """Write the regexes for `categories` (if they are not written yet) and extract the information of their messages.
@@ -73,6 +74,9 @@ def extract_categories(df: Union[pd.DataFrame, str, Path], categories: Union[str
                     for the messages it misses (default 2; 0 = a single run)
     auto_restart    start the vLLM server when it does not answer (at the beginning or in the middle of the run) and carry on, up to
                     `max_restarts` times; only on the machine that hosts the server. False = stop with a clear message instead.
+    family_seconds  the most time one family may use over all its attempts (default 1200 s); an attempt that goes round in circles (the same
+                    check failing 4 tests in a row without progress) is stopped earlier and the next one tries another way
+    retry_failed    a family that failed is left alone for 7 days and until the checks change (failed_families.json in work_dir); True = try it again now
     max_new         write at most this many new regexes in one call (the biggest families first): a time budget for a daily run; the rest is
                     read by the generic fallback until a later call
     redo            write the regexes again even where one is already saved
@@ -148,6 +152,7 @@ def extract_categories(df: Union[pd.DataFrame, str, Path], categories: Union[str
             os.environ["LLM_REASONING_EFFORT"] = effort
         try:
             ws = rw.Workspace.from_frames(templates, assignments[["template_id", TEXT_COL]], n_samples=samples, families=families)
+            ws.budget_s = family_seconds or rw.FAMILY_BUDGET_S
             budget = max_new
             for cat in cats:
                 sel, got = select_templates(units, cat, coverage, min_messages)
@@ -164,7 +169,7 @@ def extract_categories(df: Union[pd.DataFrame, str, Path], categories: Union[str
                 res, pending, first = {}, ids, True
                 while True:
                     part = rw.run_templates(ws, pending, model, verbose=verbose, think=think, backend="vllm", workers=workers, retries=retries,
-                                            skip_done=first and not redo)
+                                            skip_done=first and not redo, retry_failed=retry_failed)
                     res.update(part)
                     down = [i for i in pending if rw.is_connection_error(part.get(i))]
                     if not down:
@@ -179,13 +184,14 @@ def extract_categories(df: Union[pd.DataFrame, str, Path], categories: Union[str
                     say(f"\nthe vLLM server stopped answering: restart {restarts} of {max_restarts} at most")
                     model = ready(model)
                     pending, first = down, False
-                saved = sum(v in ("SAVED", "already saved") for v in res.values())
+                saved = sum(v in rw.OK_RESULTS for v in res.values())
                 reg_now = rw.load_registry()
                 summary.append({"category": cat, "regexes_wanted": len(res), "saved": saved, "failed": len(res) - saved,
                                 "partial": sum(bool(reg_now.get(i, {}).get("partial")) for i in res),
+                                "waived": sum(bool(reg_now.get(i, {}).get("waived")) for i in res),
                                 "second_regexes": sum(e.get("parent") in res for e in reg_now.values()), "coverage_pct": round(100 * got, 1)})
                 for i, v in res.items():
-                    if v not in ("SAVED", "already saved"):
+                    if v not in rw.OK_RESULTS:
                         failed.append({"category": cat, "family_id": i, "messages": int(ws.registry.at[i, "message_count"]), "result": str(v)[:60],
                                        "blocked_by": ((ws.last_problems.get(i) or ["the checks were not reached"])[0])[:200],
                                        "template": str(ws.registry.at[i, "template"])[:110]})

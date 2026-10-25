@@ -2,7 +2,7 @@
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import json, os, tempfile
+import json, os, tempfile, time
 import pandas as pd
 try:
     from sms_profiling import regex_writer as RW
@@ -10,6 +10,8 @@ except ModuleNotFoundError as e:                      # the regex agent needs th
     print(f"SKIPPED: {e}. Run with ~/venvs/regex_writer/bin/python"); sys.exit(77)
 
 tmp = tempfile.mkdtemp(); RW.set_output_dir(tmp)
+SIMILAR = RW.SIMILAR_TEMPLATE_RATIO              # the std / lite fixtures below differ by one word (0.89): the similarity rule is off for them and on in its own tests at the end
+RW.SIMILAR_TEMPLATE_RATIO = 1.01
 assert RW.REGISTRY_PATH.parent == RW.OUTPUT_DIR and RW.LOG_DIR.parent == RW.OUTPUT_DIR
 
 def std(i):  return f"আপনার 0171234{i:04d} আইডির Akash Standard প্যাকের মেয়াদ শেষ হয়েছে 0{i}-Jun-26 । বর্তমান ব্যালেন্স {100 + i}.50 ।"
@@ -318,8 +320,8 @@ orig_one, orig_hb = RW._run_one, RW.HEARTBEAT_S
 RW._run_one = lambda ws_, tid, *a, **k: (_time.sleep(0.5), ("SAVED", 2, 0.5))[1]
 RW.HEARTBEAT_S = 0.12
 try:
-    wrp = RW.Workspace(pd.DataFrame({"template_id": ["a", "b"], "category": ["C", "C"], "template": ["t a", "t b"], "message_count": [9, 8], "example": ["", ""]}),
-                       {"a": ["x"], "b": ["y"]})
+    wrp = RW.Workspace(pd.DataFrame({"template_id": ["a", "b"], "category": ["C", "C"], "template": ["t [NUM] a", "t [NUM] b"], "message_count": [9, 8], "example": ["", ""]}),
+                       {"a": ["t 1 a"], "b": ["t 2 b"]})
     buf = io.StringIO()
     with redirect_stdout(buf):
         res = RW.run_templates(wrp, ["a", "b"], "m", verbose=True, workers=2, skip_done=False)
@@ -475,6 +477,7 @@ print("OK  ladder: normal -> deeper (10 different samples, 100 steps, xhigh on Q
 
 
 # ---- one message type split into near-identical families: a regex for one of them may match the others
+RW.SIMILAR_TEMPLATE_RATIO = SIMILAR
 EGP = "e GP System Dear User You have successfully completed final submission of Tender Id {t} Ref No {r}{tail} e GP System"
 ga = [EGP.format(t=100 + i, r=200 + i, tail=" WXY") for i in range(10)]
 gb = [EGP.format(t=300 + i, r=400 + i, tail="") for i in range(6)]
@@ -493,4 +496,178 @@ assert rg["other_templates_match_rate"] == 0.0 and not any("too generic" in p fo
 too_loose = RW.evaluate(wg, "ga", r"(?P<n>\d+)\s+valid\s+for", {"organisation": "e GP System"})            # still caught: it fits the OTP messages
 assert any("too generic" in p or "match_rate" in p for p in too_loose["problems"])
 print("OK  near-identical families (the same message split in two) are not each other's 'other templates'; a really loose regex is still caught")
+RW.SIMILAR_TEMPLATE_RATIO = 1.01
+
+# ---- the same message in a close shape (similarity 0.8 - 0.9) is not an "other template"; a different message still is
+RW.SIMILAR_TEMPLATE_RATIO = SIMILAR
+# shapes of one card-purchase message as the template builder split it on real data (0.85 apart); the transfer message is another message (< 0.5)
+TA = "[VAR] at [VAR] [*] [VAR] Balance Card [VAR] Acme Helpline [VAR]"
+TB = "[VAR] at [VAR] BDT [VAR] Purchase BDT [VAR] Balance Card [*] BD Acme Helpline [VAR]"
+TC = "[VAR] [NUM] Digital Transfer To [VAR] Balance Acme Helpline-[NUM]"
+ta = [f"28.05.25 at 16:{i:02d} USD {20 + i}.00 Purchase BDT {3700 + i}.24 Balance Card 4587***{3200 + i} SHOP{i}, US, Acme Helpline-16255" for i in range(10)]
+tb = [f"29.05.25 at 17:{i:02d} BDT {900 + i}.50 Purchase BDT {900 + i}.50 Balance Card 4587***{5100 + i} STORE{i}, BD Acme Helpline-16255" for i in range(10)]
+tc = [f"May {i + 1}, 2025 at 10:{i:02d} {500 + i}.00 Digital Transfer To 01712{i:06d} Balance Acme Helpline-16255" for i in range(10)]
+regT = pd.DataFrame({"template_id": ["ta", "tb", "tc"], "category": ["Bank"] * 3, "message_count": [10, 10, 10], "example": [""] * 3, "template": [TA, TB, TC]})
+wt = RW.Workspace(regT, {"ta": ta, "tb": tb, "tc": tc})
+assert wt._similar_units("ta") == {"tb"} and wt._similar_units("tb") == {"ta"} and wt._similar_units("tc") == set(), "0.89 is the same message, the transfer is another"
+RXT = r"Purchase\s+(?P<balance_currency>[A-Z]{3})\s+(?P<balance>[\d.]+)\s+Balance\s+Card\s+(?P<card>\d{4}\*{3}\d{4})"
+good = RW.evaluate(wt, "ta", RXT, {"organisation": "Acme"})
+assert not any("too generic" in p for p in good.get("problems", [])), good.get("problems")
+RW.SIMILAR_TEMPLATE_RATIO = 0.9                                             # the old limit: the close shape counted as another template
+old = RW.evaluate(RW.Workspace(regT, {"ta": ta, "tb": tb, "tc": tc}), "ta", RXT, {"organisation": "Acme"})
+RW.SIMILAR_TEMPLATE_RATIO = SIMILAR
+assert any("too generic" in p for p in old.get("problems", [])), "with 0.9 this regex was blocked"
+print("OK  a close shape of the same message is related (>= 0.8); the unrelated transfer message is not")
+
+# a handful of messages of another shape (< MIN_OTHER_TEMPLATE_MESSAGES) is not an "other template": it never gets a regex of its own
+TD = "[NUM] on [NUM] Foreign Spend Purchase BDT [NUM] Balance Card [NUM] Acme Online"
+td = [f"11.06.25 on 12:{i:02d} Foreign Spend Purchase BDT {400 + i}.00 Balance Card 4587***{7700 + i} Acme Online" for i in range(8)]
+def reg_td(n): return pd.DataFrame({"template_id": ["ta", "tb", "tc", "td"], "category": ["Bank"] * 4, "message_count": [10, 10, 10, n], "example": [""] * 4, "template": [TA, TB, TC, TD]})
+few = RW.Workspace(reg_td(3), {"ta": ta, "tb": tb, "tc": tc, "td": td[:3]})
+many = RW.Workspace(reg_td(8), {"ta": ta, "tb": tb, "tc": tc, "td": td})
+assert "td" not in few._similar_units("ta"), "the foreign-spend message is a different shape"
+assert not any("too generic" in p for p in RW.evaluate(few, "ta", RXT, {"organisation": "Acme"}).get("problems", [])), "3 messages: not an 'other template'"
+assert any("too generic" in p for p in RW.evaluate(many, "ta", RXT, {"organisation": "Acme"}).get("problems", [])), "8 messages of another shape still count"
+RW.SIMILAR_TEMPLATE_RATIO = 1.01
+
+# ---- a constant notice (one text, no variable part) has nothing to extract: the agent is not asked, and the result is not a failure
+CONST = "আপনার কার্ডটি ডেলিভারির জন্য প্রস্তুত, অনুগ্রহ করে শাখা থেকে সংগ্রহ করুন"
+regK = pd.DataFrame({"template_id": ["k1", "k2", "k3"], "category": ["Bank"] * 3, "message_count": [6, 5, 6], "example": [""] * 3,
+                     "template": [CONST, "Your code is [NUM] ok", CONST + " today"]})
+wk = RW.Workspace(regK, {"k1": [CONST] * 6, "k2": ["Your code is 123456 ok"] * 5, "k3": [CONST + " today", CONST + "  today"] * 3})
+assert wk.is_constant_notice("k1") and not wk.is_constant_notice("k2"), "a template WITH a slot is never a constant notice, even when its text repeats"
+assert wk.is_constant_notice("k3"), "spacing differences do not make a second text"
+asked = []
+real_run_one = RW._run_one
+RW._run_one = lambda ws_, tid, *a, **k: (asked.append(tid), ("SAVED", 1, 0.0))[1]
+try:
+    res = RW.run_templates(wk, ["k1", "k2", "k3"], "m", skip_done=False, verbose=False, workers=2)
+finally:
+    RW._run_one = real_run_one
+assert res == {"k1": "constant notice", "k2": "SAVED", "k3": "constant notice"} and asked == ["k2"], (res, asked)
+assert all(v in RW.OK_RESULTS for v in res.values())
+print("OK  a constant notice is reported as 'constant notice' without calling the agent; a message with a slot still goes to the agent")
+
+# ================= self-fixing at runtime: stall detection, relaxed limit from rung 2, time budget, remembered failures =================
+WALL = "too generic: matches {}% of other templates' messages (max 5%); add fixed anchor words from this template's own wording"
+assert RW._kind(WALL.format(48)) == RW._kind(WALL.format(11)) and RW._kind("group(s) ['a'] swallow most of the message (free text)") == RW._kind("group(s) ['bb', 'c'] swallow most of the message (free text)")
+assert RW._kind(WALL.format(48)) != RW._kind("match_rate 0.40 < 0.95: see not_matched")
+wst = RW.Workspace(regT, {"ta": ta, "tb": tb, "tc": tc})
+for score in (-0.40, -0.40, -0.41):
+    wst.record_attempt("ta", [WALL.format(48)], score)
+assert not wst.stalled("ta"), "three tests are not enough"
+wst.record_attempt("ta", [WALL.format(49)], -0.41)
+assert wst.stalled("ta"), "four tests, the same wall (the numbers do not matter), no progress"
+wst.record_attempt("ta", [WALL.format(30)], -0.20)
+assert not wst.stalled("ta"), "the score rose: the agent is getting somewhere"
+wst.record_attempt("ta", ["match_rate 0.40 < 0.95: see not_matched"], -0.4)
+assert not wst.stalled("ta"), "another wall: the agent is moving"
+wst.history["ta"].clear()
+for _ in range(4):
+    wst.record_attempt("ta", [], 1.0)
+assert not wst.stalled("ta"), "a passing test is never a stall"
+
+class FakeUI:
+    attempts = 0
+    def __init__(self): self.lines = []
+    def on_message(self, m): pass
+    def log_only(self, t): self.lines.append(str(t))
+class FakeAgent:
+    """An 'agent' that tests the same too-loose regex over and over (50 times if nobody stops it)."""
+    def __init__(self, ws_, tid, test=True): self.ws, self.tid, self.test, self.count = ws_, tid, test, 0
+    def stream(self, *a, **k):
+        for _ in range(50):
+            self.count += 1
+            if self.test:
+                RW.evaluate(self.ws, self.tid, r"(?P<n>\d+)\s+valid\s+for")
+            yield {"model": {"messages": []}}
+orig_build = RW.build_agent
+try:
+    wgs = RW.Workspace(regG, {"ga": ga, "gb": gb, "gc": gc}); fa = FakeAgent(wgs, "ga"); ui_s = FakeUI()
+    RW.build_agent = lambda *a, **k: (fa, None)
+    out = RW._agent_run(wgs, "ga", "p", "m", False, "vllm", ui_s, None, 100)
+    assert out.startswith("no regex saved (stalled on:") and fa.count == RW.STALL_ATTEMPTS, (out, fa.count)
+    assert any("stopped" in l for l in ui_s.lines)
+    wgt = RW.Workspace(regG, {"ga": ga, "gb": gb, "gc": gc}); fb = FakeAgent(wgt, "ga", test=False)
+    RW.build_agent = lambda *a, **k: (fb, None)
+    wgt.deadline["ga"] = time.time() - 1
+    out = RW._agent_run(wgt, "ga", "p", "m", False, "vllm", FakeUI(), None, 100)
+    assert out == "no regex saved (time budget used)" and fb.count == 1, (out, fb.count)
+finally:
+    RW.build_agent = orig_build
+print("OK  an agent that tests the same wall 4 times without progress is stopped at once (not after 60-100 steps); so is a family past its time budget")
+
+# rung 2 and 3 accept up to SOFT_FP_CEILING of other templates' messages (told to the agent); a spent time budget ends the climb
+seen = []
+def stub_fp(ws_, tid, prompt, model_name, think, backend, ui, effort, recursion):
+    seen.append((ws_.fp_ceiling.get(tid), "OTHER templates" in prompt))
+    return "no regex saved (checks not passed)"
+try:
+    RW._agent_run = stub_fp
+    RW._run_one(RW.Workspace(regL, {"lad": LA + LB}), "lad", "qwen3.8-27b", True, "vllm", RW.Progress(False))
+    assert seen == [(None, False), (RW.SOFT_FP_CEILING, True), (RW.SOFT_FP_CEILING, True)], seen
+    seen.clear(); wbud = RW.Workspace(regL, {"lad": LA + LB}); wbud.budget_s = -1
+    r_b = RW._run_one(wbud, "lad", "qwen3.8-27b", True, "vllm", RW.Progress(False))
+    assert len(seen) == 1 and "time budget" in r_b[0], (seen, r_b)
+finally:
+    RW._agent_run = orig_agent_run
+RW.SIMILAR_TEMPLATE_RATIO = 1.01
+wfp = RW.Workspace(regT, {"ta": ta, "tb": tb, "tc": tc})
+assert any("too generic" in p for p in RW.evaluate(wfp, "ta", RXT, {"organisation": "Acme"})["problems"]), "50% of the other templates: refused at the normal limit"
+wfp.fp_ceiling["ta"] = RW.SOFT_FP_CEILING
+relaxed = RW.evaluate(wfp, "ta", RXT, {"organisation": "Acme"})
+assert not any("too generic" in p for p in relaxed["problems"]) and relaxed["other_templates_ceiling"] == RW.SOFT_FP_CEILING and relaxed["other_templates_match_rate"] > RW.MAX_FALSE_POSITIVE
+wfp.fp_ceiling["ta"] = 0.3
+assert any("too generic" in p and "max 30%" in p for p in RW.evaluate(wfp, "ta", RXT, {"organisation": "Acme"})["problems"]), "a regex that reads even more is still refused"
+# what is accepted under the relaxed limit is marked in the registry
+canned = dict(RW.evaluate(ws, "std", GOOD, FACTS)); assert canned["passed"]
+canned["other_templates_match_rate"] = 0.4
+orig_eval = RW.evaluate; RW.evaluate = lambda *a, **k: canned
+try:
+    out = RW.make_tools(ws, "m")[2]("std", GOOD, {"phone": "number", "expiry": "expiry date", "balance": "balance"}, "order_paid", FACTS)
+finally:
+    RW.evaluate = orig_eval
+assert out == "SAVED" and RW.load_registry()["std"]["waived"] == {"other_templates_match_rate": 0.4}, out
+print("OK  from rung 2 a regex may read up to 50% of other templates' messages (the agent is told, the registry says 'waived'); more than that is still refused")
+
+# families that fail are remembered: not tried again for 7 days or until the checks change; solved ones are forgotten
+tmp2 = tempfile.mkdtemp(); RW.set_output_dir(tmp2)
+runs = []; outcome = {"r": "fail"}
+def fake_one(ws_, tid, *a, **k):
+    runs.append(tid)
+    ws_.last_problems[tid] = [WALL.format(48)]
+    return {"fail": ("no regex saved (stalled on: x)", 3, 1.0), "ok": ("SAVED", 1, 1.0), "conn": ("error: OpenAIConnectionError: Connection error.", 0, 0.0)}[outcome["r"]]
+real_one = RW._run_one; RW._run_one = fake_one
+try:
+    wf = RW.Workspace(regT, {"ta": ta, "tb": tb, "tc": tc})
+    go = lambda **k: RW.run_templates(wf, ["ta", "tb"], "m", skip_done=True, verbose=False, workers=2, **k)
+    r1 = go(); assert sorted(runs) == ["ta", "tb"] and set(r1.values()) == {"no regex saved (stalled on: x)"}
+    stored = RW.load_failed(); assert set(stored) == {"ta", "tb"} and stored["ta"]["checks_version"] == RW.CHECKS_VERSION and stored["ta"]["blocked_by"].startswith("too generic")
+    r2 = go(); assert len(runs) == 2 and set(r2.values()) == {"failed before (skipped)"}, "a failed family is left alone"
+    assert wf.last_problems["ta"][0].startswith("too generic"), "the report still says what blocked it"
+    assert not any(v in RW.OK_RESULTS for v in r2.values())
+    go(retry_failed=True); assert len(runs) == 4, "retry_failed=True tries it again"
+    real_version = RW.CHECKS_VERSION
+    fp1, old_limit = RW._checks_fingerprint(), RW.MAX_FALSE_POSITIVE
+    assert isinstance(real_version, str) and len(fp1) >= 7 and fp1 == RW._checks_fingerprint(), "the version is a fingerprint of the checks, stable between calls"
+    RW.MAX_FALSE_POSITIVE = 0.07
+    try:
+        assert RW._checks_fingerprint() != fp1, "changing a limit changes the version by itself"
+    finally:
+        RW.MAX_FALSE_POSITIVE = old_limit
+    RW.CHECKS_VERSION = "another-version"
+    try:
+        go(); assert len(runs) == 6, "after the checks changed it is tried again by itself"
+    finally:
+        RW.CHECKS_VERSION = real_version
+    old = RW.load_failed(); old["ta"]["failed_at"] = "2000-01-01 00:00:00"; RW.FAILED_PATH.write_text(json.dumps(old))
+    go(); assert runs[-2:] == ["ta", "tb"] or sorted(runs[-1:]) == ["ta"], "old failures are tried again"
+    n_before = len(runs); outcome["r"] = "ok"; go(retry_failed=True)
+    assert RW.load_failed() == {}, "families that now have a regex are no longer 'failed'"
+    outcome["r"] = "conn"; go(retry_failed=True)
+    assert RW.load_failed() == {}, "a server outage is not a failure of the family"
+finally:
+    RW._run_one = real_one
+    RW.set_output_dir(tmp)
+print("OK  failed families are remembered (not retried for 7 days or until the checks change, retry_failed=True overrides); solved ones are forgotten; outages are not recorded")
 print("\nALL REGEX WRITER TESTS PASSED")
