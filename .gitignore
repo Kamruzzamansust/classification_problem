@@ -1,0 +1,25 @@
+# Customer data and everything the pipeline generates must never be committed.
+data/
+output/
+classify_data/
+regex_*/
+*.csv
+*.json
+*.ipynb
+.ipynb_checkpoints/
+*.log
+*.bak
+
+# Documentation is not published (README, .md files).
+*.md
+README*
+
+# Local scratch and ad-hoc runner scripts.
+/run_*.py
+/_*.py
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
